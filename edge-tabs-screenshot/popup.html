@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div id="app">
+    <h1>Tabs Screenshot</h1>
+
+    <!-- 設定パネル -->
+    <div id="settings-panel">
+      <!-- モード選択 -->
+      <div class="setting-group">
+        <label class="setting-label">撮影モード</label>
+        <div class="radio-group">
+          <label class="radio-item">
+            <input type="radio" name="captureMode" value="full" checked>
+            <span>全体キャプチャ</span>
+          </label>
+          <label class="radio-item">
+            <input type="radio" name="captureMode" value="visible">
+            <span>表示範囲のみ</span>
+          </label>
+        </div>
+      </div>
+
+      <!-- 画像形式 -->
+      <div class="setting-group">
+        <label class="setting-label">画像形式</label>
+        <div class="radio-group">
+          <label class="radio-item">
+            <input type="radio" name="imageFormat" value="png" checked>
+            <span>PNG</span>
+          </label>
+          <label class="radio-item">
+            <input type="radio" name="imageFormat" value="jpeg">
+            <span>JPEG</span>
+          </label>
+        </div>
+      </div>
+
+      <!-- JPEG品質 (JPEG選択時のみ表示) -->
+      <div class="setting-group" id="jpeg-quality-group" style="display:none;">
+        <label class="setting-label">JPEG品質: <span id="quality-value">85</span>%</label>
+        <input type="range" id="jpeg-quality" min="10" max="100" value="85" step="5">
+      </div>
+
+      <!-- Lazy load対策スクロール -->
+      <div class="setting-group">
+        <label class="checkbox-item">
+          <input type="checkbox" id="preScroll" checked>
+          <span>撮影前に最下部まで一度スクロールする (Lazy load対策)</span>
+        </label>
+      </div>
+
+      <!-- 実行ボタン -->
+      <button id="btn-start" class="btn-primary">スクリーンショット開始</button>
+    </div>
+
+    <!-- 進捗パネル -->
+    <div id="progress-panel" style="display:none;">
+      <div class="progress-header">
+        <span id="progress-text">準備中...</span>
+      </div>
+      <div class="progress-bar-container">
+        <div class="progress-bar" id="progress-bar"></div>
+      </div>
+      <div id="progress-detail" class="progress-detail"></div>
+    </div>
+
+    <!-- 結果パネル -->
+    <div id="result-panel" style="display:none;">
+      <div id="result-summary" class="result-summary"></div>
+      <div id="skip-error-list" class="skip-error-list"></div>
+      <button id="btn-reset" class="btn-secondary">閉じる</button>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

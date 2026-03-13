@@ -1,0 +1,171 @@
+/* === 基本スタイル === */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  width: 360px;
+  font-family: "Segoe UI", "Meiryo", sans-serif;
+  font-size: 13px;
+  color: #1a1a1a;
+  background: #f8f9fa;
+}
+
+#app {
+  padding: 16px;
+}
+
+h1 {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 14px;
+  color: #0078d4;
+  border-bottom: 2px solid #0078d4;
+  padding-bottom: 8px;
+}
+
+/* === 設定グループ === */
+.setting-group {
+  margin-bottom: 12px;
+}
+
+.setting-label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 4px;
+  font-size: 12px;
+  color: #444;
+}
+
+.radio-group {
+  display: flex;
+  gap: 12px;
+}
+
+.radio-item,
+.checkbox-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.radio-item input,
+.checkbox-item input {
+  accent-color: #0078d4;
+}
+
+/* === スライダー === */
+input[type="range"] {
+  width: 100%;
+  accent-color: #0078d4;
+}
+
+/* === ボタン === */
+.btn-primary {
+  display: block;
+  width: 100%;
+  padding: 10px;
+  margin-top: 14px;
+  background: #0078d4;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.btn-primary:hover {
+  background: #005a9e;
+}
+
+.btn-primary:disabled {
+  background: #9ec5e8;
+  cursor: not-allowed;
+}
+
+.btn-secondary {
+  display: block;
+  width: 100%;
+  padding: 8px;
+  margin-top: 10px;
+  background: #e0e0e0;
+  color: #333;
+  border: none;
+  border-radius: 4px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.btn-secondary:hover {
+  background: #ccc;
+}
+
+/* === プログレス === */
+.progress-header {
+  font-weight: 600;
+  margin-bottom: 6px;
+  font-size: 13px;
+}
+
+.progress-bar-container {
+  width: 100%;
+  height: 8px;
+  background: #ddd;
+  border-radius: 4px;
+  overflow: hidden;
+  margin-bottom: 6px;
+}
+
+.progress-bar {
+  height: 100%;
+  width: 0%;
+  background: #0078d4;
+  border-radius: 4px;
+  transition: width 0.3s ease;
+}
+
+.progress-detail {
+  font-size: 12px;
+  color: #555;
+  max-height: 120px;
+  overflow-y: auto;
+  line-height: 1.5;
+}
+
+/* === 結果 === */
+.result-summary {
+  padding: 10px;
+  background: #e8f5e9;
+  border-radius: 4px;
+  margin-bottom: 8px;
+  line-height: 1.6;
+  font-size: 13px;
+}
+
+.result-summary.has-errors {
+  background: #fff3e0;
+}
+
+.skip-error-list {
+  max-height: 160px;
+  overflow-y: auto;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.skip-error-list .item-skip {
+  color: #e65100;
+  padding: 2px 0;
+}
+
+.skip-error-list .item-error {
+  color: #c62828;
+  padding: 2px 0;
+}
