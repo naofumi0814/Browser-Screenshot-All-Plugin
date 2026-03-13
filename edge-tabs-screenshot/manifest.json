@@ -1,19 +1,17 @@
 {
   "manifest_version": 3,
   "name": "Edge Tabs Screenshot All",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "現在のEdgeウィンドウの全タブをスクリーンショット撮影し、ZIPで保存する拡張機能",
   "permissions": [
     "tabs",
     "activeTab",
     "scripting",
     "downloads",
-    "storage",
-    "offscreen"
+    "storage"
   ],
   "host_permissions": [
-    "http://*/*",
-    "https://*/*"
+    "<all_urls>"
   ],
   "action": {
     "default_popup": "popup.html",

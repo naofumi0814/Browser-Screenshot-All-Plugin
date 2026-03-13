@@ -1,11 +1,11 @@
-// background.js - Service Worker: キャプチャ処理の制御
+// background.js - Service Worker: キャプチャ処理の全制御
+// offscreen document は使わない。OffscreenCanvas + createImageBitmap で完結させる。
 
 "use strict";
 
-// JSZipをService Worker内で直接読み込む
 importScripts("lib/jszip.min.js");
 
-// === 処理中フラグ (二重実行防止) ===
+// === 処理中フラグ ===
 let isRunning = false;
 
 // === メッセージ受信 ===
@@ -16,32 +16,53 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true;
     }
     isRunning = true;
+    // 進捗をstorageに初期化
+    chrome.storage.local.set({ captureStatus: "running", captureProgress: null, captureResult: null });
     sendResponse({ ok: true });
     startCapture(message.settings).finally(() => {
       isRunning = false;
     });
     return true;
   }
+
+  if (message.action === "getStatus") {
+    sendResponse({ isRunning });
+    return false;
+  }
 });
+
+// === 安全なメッセージ送信 (popupが閉じていてもクラッシュしない) ===
+function safeSendMessage(msg) {
+  try {
+    chrome.runtime.sendMessage(msg).catch(() => {});
+  } catch (_) {}
+}
+
+// === 進捗をstorageに保存 + popupへも送信(届かなくてもOK) ===
+function reportProgress(current, total, tabTitle, status) {
+  const progress = { current, total, tabTitle, status };
+  chrome.storage.local.set({ captureProgress: progress });
+  safeSendMessage({ type: "progress", ...progress });
+}
 
 // === メインのキャプチャ処理 ===
 async function startCapture(settings) {
   const { captureMode, imageFormat, jpegQuality, preScroll } = settings;
   const mimeType = imageFormat === "jpeg" ? "image/jpeg" : "image/png";
   const fileExt = imageFormat === "jpeg" ? ".jpg" : ".png";
-  const quality = imageFormat === "jpeg" ? jpegQuality / 100 : undefined;
 
   try {
-    // 現在のウィンドウの全タブを取得
+    // 現在のウィンドウの全タブを取得 (windowIdを保持)
     const currentWindow = await chrome.windows.getCurrent({ populate: true });
+    const windowId = currentWindow.id;
     const tabs = currentWindow.tabs;
     const totalTabs = tabs.length;
-
-    // 元のアクティブタブを記憶
     const originalActiveTab = tabs.find((t) => t.active);
 
+    console.log(`[TabsScreenshot] 開始: ${totalTabs}タブ, モード=${captureMode}, 形式=${imageFormat}`);
+
     const results = [];
-    const capturedImages = []; // { filename, dataUrl, metadata }
+    const capturedImages = [];
 
     for (let i = 0; i < totalTabs; i++) {
       const tab = tabs[i];
@@ -51,24 +72,21 @@ async function startCapture(settings) {
 
       // スキップ判定
       if (shouldSkipTab(tab)) {
-        const result = {
-          tabIndex,
-          title,
-          url: tab.url,
-          hostname,
-          captureMode,
+        results.push({
+          tabIndex, title, url: tab.url, hostname, captureMode,
           status: "skipped",
           errorMessage: "システムページまたはアクセス不可のURL",
           capturedAt: new Date().toISOString(),
-        };
-        results.push(result);
-        notifyProgress(tabIndex, totalTabs, title, "skipped");
+        });
+        reportProgress(tabIndex, totalTabs, title, "skipped");
+        console.log(`[TabsScreenshot] Tab${tabIndex} スキップ: ${tab.url}`);
         continue;
       }
 
       try {
         // タブをアクティブにする
         await chrome.tabs.update(tab.id, { active: true });
+        console.log(`[TabsScreenshot] Tab${tabIndex} アクティブ化: ${title}`);
 
         // タブがアクティブになるのを確実に待つ
         await waitForTabActivation(tab.id);
@@ -77,21 +95,18 @@ async function startCapture(settings) {
         await waitForTabLoad(tab.id);
 
         // 描画安定化のため待機
-        await sleep(600);
+        await sleep(800);
 
         let dataUrl;
 
         if (captureMode === "full") {
-          // 全体キャプチャ
-          dataUrl = await captureFullPage(tab.id, mimeType, quality, preScroll, imageFormat);
+          dataUrl = await captureFullPage(tab.id, windowId, mimeType, imageFormat, jpegQuality, preScroll);
         } else {
-          // 表示範囲のみキャプチャ
-          // windowIdを都度取得して確実に現在のウィンドウをキャプチャ
-          const win = await chrome.windows.getCurrent();
-          dataUrl = await chrome.tabs.captureVisibleTab(win.id, {
-            format: imageFormat,
-            quality: imageFormat === "jpeg" ? jpegQuality : undefined,
-          });
+          dataUrl = await captureVisibleTabSafe(windowId, imageFormat, jpegQuality);
+        }
+
+        if (!dataUrl) {
+          throw new Error("キャプチャ結果が空でした");
         }
 
         const safeTitle = sanitizeFilename(title);
@@ -100,31 +115,22 @@ async function startCapture(settings) {
         const filename = `${paddedIndex}_${safeHostname}_${safeTitle}${fileExt}`;
 
         capturedImages.push({ filename, dataUrl });
-        const result = {
-          tabIndex,
-          title,
-          url: tab.url,
-          hostname,
-          captureMode,
-          status: "success",
-          errorMessage: null,
+        results.push({
+          tabIndex, title, url: tab.url, hostname, captureMode,
+          status: "success", errorMessage: null,
           capturedAt: new Date().toISOString(),
-        };
-        results.push(result);
-        notifyProgress(tabIndex, totalTabs, title, "success");
+        });
+        reportProgress(tabIndex, totalTabs, title, "success");
+        console.log(`[TabsScreenshot] Tab${tabIndex} 成功: ${title}`);
       } catch (err) {
-        const result = {
-          tabIndex,
-          title,
-          url: tab.url,
-          hostname,
-          captureMode,
+        results.push({
+          tabIndex, title, url: tab.url, hostname, captureMode,
           status: "error",
           errorMessage: err.message || String(err),
           capturedAt: new Date().toISOString(),
-        };
-        results.push(result);
-        notifyProgress(tabIndex, totalTabs, title, "error");
+        });
+        reportProgress(tabIndex, totalTabs, title, "error");
+        console.error(`[TabsScreenshot] Tab${tabIndex} エラー:`, err);
       }
     }
 
@@ -132,9 +138,7 @@ async function startCapture(settings) {
     if (originalActiveTab) {
       try {
         await chrome.tabs.update(originalActiveTab.id, { active: true });
-      } catch (_) {
-        // 元タブが閉じられていた場合は無視
-      }
+      } catch (_) {}
     }
 
     // ZIP作成＆ダウンロード
@@ -142,226 +146,192 @@ async function startCapture(settings) {
       await createAndDownloadZip(capturedImages, results, settings);
     }
 
-    // 完了通知
+    // 完了結果をstorageに保存
     const successCount = results.filter((r) => r.status === "success").length;
     const skipCount = results.filter((r) => r.status === "skipped").length;
     const errorCount = results.filter((r) => r.status === "error").length;
 
-    chrome.runtime.sendMessage({
-      type: "complete",
-      successCount,
-      skipCount,
-      errorCount,
-      results,
-    });
+    const captureResult = { successCount, skipCount, errorCount, results };
+    chrome.storage.local.set({ captureStatus: "done", captureResult });
+    safeSendMessage({ type: "complete", ...captureResult });
+
+    console.log(`[TabsScreenshot] 完了: 成功=${successCount}, スキップ=${skipCount}, エラー=${errorCount}`);
   } catch (err) {
-    chrome.runtime.sendMessage({
-      type: "error",
-      error: "致命的エラー: " + (err.message || String(err)),
+    console.error("[TabsScreenshot] 致命的エラー:", err);
+    const errorMsg = "致命的エラー: " + (err.message || String(err));
+    chrome.storage.local.set({
+      captureStatus: "done",
+      captureResult: { successCount: 0, skipCount: 0, errorCount: 1, results: [], fatalError: errorMsg },
     });
+    safeSendMessage({ type: "error", error: errorMsg });
+  }
+}
+
+// === captureVisibleTab のラッパー (リトライ付き) ===
+async function captureVisibleTabSafe(windowId, imageFormat, jpegQuality, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const options = { format: imageFormat };
+      if (imageFormat === "jpeg") {
+        options.quality = jpegQuality || 85;
+      }
+      const dataUrl = await chrome.tabs.captureVisibleTab(windowId, options);
+      return dataUrl;
+    } catch (err) {
+      console.warn(`[TabsScreenshot] captureVisibleTab 試行${attempt}/${retries} 失敗:`, err.message);
+      if (attempt === retries) throw err;
+      await sleep(500 * attempt);
+    }
   }
 }
 
 // === 全体キャプチャ ===
-async function captureFullPage(tabId, mimeType, quality, preScroll, imageFormat) {
+async function captureFullPage(tabId, windowId, mimeType, imageFormat, jpegQuality, preScroll) {
   // content scriptを注入
   await chrome.scripting.executeScript({
     target: { tabId },
     files: ["content.js"],
   });
+  await sleep(100);
 
   // ページ情報を取得
-  const pageInfoResults = await chrome.tabs.sendMessage(tabId, {
-    action: "getPageInfo",
-  });
-  const pageInfo = pageInfoResults;
+  const pageInfo = await chrome.tabs.sendMessage(tabId, { action: "getPageInfo" });
+  const { scrollHeight, viewportWidth, viewportHeight } = pageInfo;
 
-  const { scrollWidth, scrollHeight, viewportWidth, viewportHeight } = pageInfo;
+  console.log(`[TabsScreenshot] ページ情報: scrollHeight=${scrollHeight}, viewportHeight=${viewportHeight}`);
 
-  // スクロールが不要な場合（ページがビューポートに収まっている場合）
+  // スクロール不要
   if (scrollHeight <= viewportHeight + 5) {
-    const currentWindow = await chrome.windows.getCurrent();
-    return await chrome.tabs.captureVisibleTab(currentWindow.id, {
-      format: imageFormat,
-      quality: imageFormat === "jpeg" ? (quality ? quality * 100 : 85) : undefined,
-    });
+    return await captureVisibleTabSafe(windowId, imageFormat, jpegQuality);
   }
 
-  // Lazy load対策: 一度最下部までスクロールしてから戻す
+  // Lazy load対策
   if (preScroll) {
     await chrome.tabs.sendMessage(tabId, { action: "preScrollForLazyLoad" });
     await sleep(500);
   }
 
-  // fixedヘッダー等の検出
+  // fixed要素を一時的にabsoluteに変更
   await chrome.tabs.sendMessage(tabId, { action: "hideFixedElements" });
 
   // 分割キャプチャ
   const captures = [];
   let currentY = 0;
-  const stepHeight = viewportHeight;
 
   while (currentY < scrollHeight) {
-    // 実際にスクロール可能な最大値を考慮
-    const scrollTo = Math.min(currentY, scrollHeight - viewportHeight);
+    const scrollTo = Math.min(currentY, Math.max(0, scrollHeight - viewportHeight));
 
-    await chrome.tabs.sendMessage(tabId, {
-      action: "scrollTo",
-      y: scrollTo,
-    });
+    await chrome.tabs.sendMessage(tabId, { action: "scrollTo", y: scrollTo });
+    await sleep(350);
 
-    // スクロール後の描画待機
-    await sleep(250);
+    const dataUrl = await captureVisibleTabSafe(windowId, imageFormat, jpegQuality);
 
-    const currentWindow = await chrome.windows.getCurrent();
-    const dataUrl = await chrome.tabs.captureVisibleTab(currentWindow.id, {
-      format: imageFormat,
-      quality: imageFormat === "jpeg" ? (quality ? quality * 100 : 85) : undefined,
-    });
-
-    // 実際のスクロール位置を取得
-    const actualScrollResults = await chrome.tabs.sendMessage(tabId, {
-      action: "getScrollPosition",
-    });
-    const actualScrollY = actualScrollResults.scrollY;
+    const pos = await chrome.tabs.sendMessage(tabId, { action: "getScrollPosition" });
 
     captures.push({
       dataUrl,
-      scrollY: actualScrollY,
+      scrollY: pos.scrollY,
       viewportHeight,
     });
 
-    currentY += stepHeight;
+    currentY += viewportHeight;
 
-    // 最後のキャプチャで末端に到達した場合は終了
-    if (scrollTo >= scrollHeight - viewportHeight) {
-      break;
-    }
+    if (scrollTo >= scrollHeight - viewportHeight) break;
   }
 
-  // fixed要素を復元
-  await chrome.tabs.sendMessage(tabId, { action: "restoreFixedElements" });
+  // fixed要素を復元 & スクロールを先頭に戻す
+  try { await chrome.tabs.sendMessage(tabId, { action: "restoreFixedElements" }); } catch (_) {}
+  try { await chrome.tabs.sendMessage(tabId, { action: "scrollTo", y: 0 }); } catch (_) {}
 
-  // スクロール位置を元に戻す
-  await chrome.tabs.sendMessage(tabId, { action: "scrollTo", y: 0 });
-
-  // キャプチャが1枚だけならそのまま返す
   if (captures.length === 1) {
     return captures[0].dataUrl;
   }
 
-  // offscreenで画像を結合
-  const stitchedDataUrl = await stitchImagesViaOffscreen(
-    captures,
-    scrollHeight,
-    viewportWidth,
-    viewportHeight,
-    mimeType,
-    quality
-  );
-
-  return stitchedDataUrl;
+  // OffscreenCanvas で画像結合 (Service Worker内で完結)
+  return await stitchImagesInWorker(captures, scrollHeight, viewportWidth, viewportHeight, mimeType);
 }
 
-// === offscreen documentで画像結合 ===
-async function stitchImagesViaOffscreen(captures, totalHeight, viewportWidth, viewportHeight, mimeType, quality) {
-  // offscreen documentを作成
-  await ensureOffscreenDocument();
+// === OffscreenCanvas で画像結合 (offscreen document 不要) ===
+async function stitchImagesInWorker(captures, totalHeight, viewportWidth, viewportHeight, mimeType) {
+  console.log(`[TabsScreenshot] 画像結合: ${captures.length}枚, totalHeight=${totalHeight}`);
 
-  // キャプチャデータを1枚ずつoffscreenに送信して蓄積させる
-  // 一括送信すると大きすぎてメッセージが失われるため分割する
+  // 最初の画像を読み込んでスケールを確認
+  const firstBlob = await (await fetch(captures[0].dataUrl)).blob();
+  const firstBitmap = await createImageBitmap(firstBlob);
+  const scale = firstBitmap.width / viewportWidth;
+
+  const canvasWidth = Math.round(viewportWidth * scale);
+  const canvasHeight = Math.min(Math.round(totalHeight * scale), 65535);
+
+  const canvas = new OffscreenCanvas(canvasWidth, canvasHeight);
+  const ctx = canvas.getContext("2d");
+
   for (let i = 0; i < captures.length; i++) {
-    await sendMessageToOffscreen({
-      action: "addCaptureChunk",
-      index: i,
-      dataUrl: captures[i].dataUrl,
-      scrollY: captures[i].scrollY,
-      viewportHeight: captures[i].viewportHeight,
-    });
-  }
-
-  // 全チャンクを送り終えたら結合実行を指示
-  const response = await sendMessageToOffscreen({
-    action: "stitchAccumulatedImages",
-    totalCaptures: captures.length,
-    totalHeight,
-    viewportWidth,
-    viewportHeight,
-    mimeType,
-    quality,
-  });
-
-  // offscreen documentを閉じる
-  try {
-    await chrome.offscreen.closeDocument();
-  } catch (_) {}
-
-  if (response && response.error) {
-    throw new Error(response.error);
-  }
-
-  return response.dataUrl;
-}
-
-// === offscreen documentの存在を保証 ===
-async function ensureOffscreenDocument() {
-  try {
-    await chrome.offscreen.createDocument({
-      url: "offscreen.html",
-      reasons: ["CANVAS"],
-      justification: "画像の結合処理にCanvasを使用",
-    });
-  } catch (e) {
-    if (!e.message.includes("Only a single offscreen")) {
-      throw e;
+    let bitmap;
+    if (i === 0) {
+      bitmap = firstBitmap;
+    } else {
+      const blob = await (await fetch(captures[i].dataUrl)).blob();
+      bitmap = await createImageBitmap(blob);
     }
+
+    const drawY = Math.round(captures[i].scrollY * scale);
+
+    if (i === captures.length - 1) {
+      // 最後のキャプチャは下端に合わせる
+      const bottomAlignY = canvasHeight - bitmap.height;
+      ctx.drawImage(bitmap, 0, Math.max(drawY, bottomAlignY));
+    } else {
+      ctx.drawImage(bitmap, 0, drawY);
+    }
+
+    if (i !== 0) bitmap.close();
   }
+  firstBitmap.close();
+
+  // CanvasをBlobに変換 → base64 data URL にする
+  const quality = mimeType === "image/jpeg" ? 0.85 : undefined;
+  const resultBlob = await canvas.convertToBlob({ type: mimeType, quality });
+  const arrayBuffer = await resultBlob.arrayBuffer();
+  const base64 = arrayBufferToBase64(arrayBuffer);
+
+  return `data:${mimeType};base64,${base64}`;
 }
 
-// === offscreenへのメッセージ送信 (sendMessageとの競合を避ける) ===
-function sendMessageToOffscreen(msg) {
-  return new Promise((resolve, reject) => {
-    // offscreenドキュメントにはruntime.sendMessageで送るが、
-    // targetをoffscreenに限定するためフラグを付与
-    msg._targetOffscreen = true;
-    chrome.runtime.sendMessage(msg, (response) => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
-      } else {
-        resolve(response);
-      }
-    });
-  });
+// === ArrayBufferをbase64に変換 ===
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const end = Math.min(i + chunkSize, bytes.length);
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, end));
+  }
+  return btoa(binary);
 }
 
 // === ZIP作成＆ダウンロード ===
-// Service Worker内で直接JSZipを使ってZIP作成する
-// offscreenへの大量データ送信を避けることで、全タブ確実に保存できる
 async function createAndDownloadZip(capturedImages, results, settings) {
+  console.log(`[TabsScreenshot] ZIP作成: ${capturedImages.length}枚の画像`);
+
   const now = new Date();
   const timestamp = formatTimestamp(now);
   const zipFilename = `edge_tabs_capture_${timestamp}.zip`;
 
-  // metadata.json作成
   const metadata = results.map((r) => ({
-    tabIndex: r.tabIndex,
-    title: r.title,
-    url: r.url,
-    hostname: r.hostname,
-    captureMode: r.captureMode,
-    status: r.status,
-    errorMessage: r.errorMessage,
+    tabIndex: r.tabIndex, title: r.title, url: r.url,
+    hostname: r.hostname, captureMode: r.captureMode,
+    status: r.status, errorMessage: r.errorMessage,
     capturedAt: r.capturedAt,
   }));
 
-  // summary.txt作成
   const successCount = results.filter((r) => r.status === "success").length;
   const skipCount = results.filter((r) => r.status === "skipped").length;
   const errorCount = results.filter((r) => r.status === "error").length;
 
   const summaryText = [
-    `Edge Tabs Screenshot - Summary`,
-    `================================`,
+    "Edge Tabs Screenshot - Summary",
+    "================================",
     `処理日時: ${now.toLocaleString("ja-JP")}`,
     `撮影モード: ${settings.captureMode === "full" ? "全体キャプチャ" : "表示範囲のみ"}`,
     `画像形式: ${settings.imageFormat.toUpperCase()}`,
@@ -369,79 +339,58 @@ async function createAndDownloadZip(capturedImages, results, settings) {
     `成功: ${successCount}`,
     `スキップ: ${skipCount}`,
     `エラー: ${errorCount}`,
-    ``,
-    `--- 詳細 ---`,
+    "",
+    "--- 詳細 ---",
     ...results.map(
-      (r) =>
-        `[${r.status.toUpperCase()}] Tab${r.tabIndex}: ${r.title} (${r.url})${r.errorMessage ? " - " + r.errorMessage : ""}`
+      (r) => `[${r.status.toUpperCase()}] Tab${r.tabIndex}: ${r.title} (${r.url})${r.errorMessage ? " - " + r.errorMessage : ""}`
     ),
   ].join("\n");
 
-  // Service Worker内で直接ZIPを生成
   const zip = new JSZip();
 
-  // 画像を追加
   for (const img of capturedImages) {
     const base64Data = img.dataUrl.split(",")[1];
     zip.file(img.filename, base64Data, { base64: true });
   }
 
-  // metadata.jsonを追加
   zip.file("metadata.json", JSON.stringify(metadata, null, 2));
-
-  // summary.txtを追加
   zip.file("summary.txt", summaryText);
 
-  // ZIPをbase64で生成
   const zipBase64 = await zip.generateAsync({
     type: "base64",
     compression: "DEFLATE",
     compressionOptions: { level: 6 },
   });
 
-  // data URLとしてダウンロード
   const dataUrl = "data:application/zip;base64," + zipBase64;
   await chrome.downloads.download({
     url: dataUrl,
     filename: zipFilename,
     saveAs: true,
   });
+
+  console.log(`[TabsScreenshot] ZIP保存完了: ${zipFilename}`);
 }
 
-// === ユーティリティ関数 ===
+// === ユーティリティ ===
 
 function shouldSkipTab(tab) {
   const url = tab.url || "";
   if (!url) return true;
-  if (
-    url.startsWith("edge://") ||
-    url.startsWith("chrome://") ||
-    url.startsWith("chrome-extension://") ||
-    url.startsWith("extension://") ||
-    url.startsWith("about:") ||
-    url.startsWith("data:") ||
-    url.startsWith("blob:") ||
-    url.startsWith("file://") ||
-    url.startsWith("devtools://") ||
-    url.startsWith("view-source:")
-  ) {
-    return true;
-  }
-  return false;
+  const skipPrefixes = [
+    "edge://", "chrome://", "chrome-extension://", "extension://",
+    "about:", "data:", "blob:", "file://", "devtools://", "view-source:",
+  ];
+  return skipPrefixes.some((prefix) => url.startsWith(prefix));
 }
 
 function getHostname(url) {
-  try {
-    return new URL(url).hostname;
-  } catch {
-    return "unknown";
-  }
+  try { return new URL(url).hostname; } catch { return "unknown"; }
 }
 
 function sanitizeFilename(name) {
-  // ファイル名に使えない文字を除去し、長さを制限
   return name
-    .replace(/[\\/:*?"<>|]/g, "")
+    .replace(/[\\/:*?"<>|#{}%&~]/g, "")
     .replace(/[\r\n\t]/g, "")
     .replace(/\s+/g, "_")
     .substring(0, 80);
@@ -449,43 +398,36 @@ function sanitizeFilename(name) {
 
 function formatTimestamp(date) {
   const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const mo = String(date.getMonth() + 1).padStart(2, "0");
   const d = String(date.getDate()).padStart(2, "0");
   const h = String(date.getHours()).padStart(2, "0");
-  const min = String(date.getMinutes()).padStart(2, "0");
+  const mi = String(date.getMinutes()).padStart(2, "0");
   const s = String(date.getSeconds()).padStart(2, "0");
-  return `${y}${m}${d}_${h}${min}${s}`;
+  return `${y}${mo}${d}_${h}${mi}${s}`;
 }
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitForTabLoad(tabId, timeout = 10000) {
+async function waitForTabLoad(tabId, timeout = 15000) {
   const start = Date.now();
   while (Date.now() - start < timeout) {
-    const tab = await chrome.tabs.get(tabId);
-    if (tab.status === "complete") return;
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.status === "complete") return;
+    } catch { return; }
     await sleep(200);
   }
 }
 
-// タブが実際にアクティブになるのを待つ
 async function waitForTabActivation(tabId, timeout = 5000) {
   const start = Date.now();
   while (Date.now() - start < timeout) {
-    const tab = await chrome.tabs.get(tabId);
-    if (tab.active) return;
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.active) return;
+    } catch { return; }
     await sleep(100);
   }
-}
-
-function notifyProgress(current, total, tabTitle, status) {
-  chrome.runtime.sendMessage({
-    type: "progress",
-    current,
-    total,
-    tabTitle,
-    status,
-  });
 }
