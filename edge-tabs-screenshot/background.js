@@ -2,6 +2,9 @@
 
 "use strict";
 
+// JSZipをService Worker内で直接読み込む
+importScripts("lib/jszip.min.js");
+
 // === 処理中フラグ (二重実行防止) ===
 let isRunning = false;
 
@@ -17,12 +20,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     startCapture(message.settings).finally(() => {
       isRunning = false;
     });
-    return true;
-  }
-
-  if (message.action === "stitchImages") {
-    // offscreen documentへ転送
-    handleStitchImages(message).then(sendResponse);
     return true;
   }
 });
@@ -73,14 +70,14 @@ async function startCapture(settings) {
         // タブをアクティブにする
         await chrome.tabs.update(tab.id, { active: true });
 
-        // 描画が落ち着くまで待機
-        await sleep(500);
+        // タブがアクティブになるのを確実に待つ
+        await waitForTabActivation(tab.id);
 
         // タブの読み込み完了を待つ
         await waitForTabLoad(tab.id);
 
-        // さらに描画安定化のため待機
-        await sleep(300);
+        // 描画安定化のため待機
+        await sleep(600);
 
         let dataUrl;
 
@@ -89,7 +86,9 @@ async function startCapture(settings) {
           dataUrl = await captureFullPage(tab.id, mimeType, quality, preScroll, imageFormat);
         } else {
           // 表示範囲のみキャプチャ
-          dataUrl = await chrome.tabs.captureVisibleTab(currentWindow.id, {
+          // windowIdを都度取得して確実に現在のウィンドウをキャプチャ
+          const win = await chrome.windows.getCurrent();
+          dataUrl = await chrome.tabs.captureVisibleTab(win.id, {
             format: imageFormat,
             quality: imageFormat === "jpeg" ? jpegQuality : undefined,
           });
@@ -267,27 +266,24 @@ async function captureFullPage(tabId, mimeType, quality, preScroll, imageFormat)
 // === offscreen documentで画像結合 ===
 async function stitchImagesViaOffscreen(captures, totalHeight, viewportWidth, viewportHeight, mimeType, quality) {
   // offscreen documentを作成
-  try {
-    await chrome.offscreen.createDocument({
-      url: "offscreen.html",
-      reasons: ["CANVAS"],
-      justification: "画像の結合処理にCanvasを使用",
+  await ensureOffscreenDocument();
+
+  // キャプチャデータを1枚ずつoffscreenに送信して蓄積させる
+  // 一括送信すると大きすぎてメッセージが失われるため分割する
+  for (let i = 0; i < captures.length; i++) {
+    await sendMessageToOffscreen({
+      action: "addCaptureChunk",
+      index: i,
+      dataUrl: captures[i].dataUrl,
+      scrollY: captures[i].scrollY,
+      viewportHeight: captures[i].viewportHeight,
     });
-  } catch (e) {
-    // すでに存在する場合は無視
-    if (!e.message.includes("Only a single offscreen")) {
-      throw e;
-    }
   }
 
-  // offscreenへメッセージを送って結合
-  const response = await chrome.runtime.sendMessage({
-    action: "stitchImages",
-    captures: captures.map((c) => ({
-      dataUrl: c.dataUrl,
-      scrollY: c.scrollY,
-      viewportHeight: c.viewportHeight,
-    })),
+  // 全チャンクを送り終えたら結合実行を指示
+  const response = await sendMessageToOffscreen({
+    action: "stitchAccumulatedImages",
+    totalCaptures: captures.length,
     totalHeight,
     viewportWidth,
     viewportHeight,
@@ -298,9 +294,7 @@ async function stitchImagesViaOffscreen(captures, totalHeight, viewportWidth, vi
   // offscreen documentを閉じる
   try {
     await chrome.offscreen.closeDocument();
-  } catch (_) {
-    // 閉じられない場合は無視
-  }
+  } catch (_) {}
 
   if (response && response.error) {
     throw new Error(response.error);
@@ -309,30 +303,41 @@ async function stitchImagesViaOffscreen(captures, totalHeight, viewportWidth, vi
   return response.dataUrl;
 }
 
-// === offscreenへのStitchメッセージのハンドリング ===
-async function handleStitchImages(message) {
-  // offscreenのcontextで実行されるため、ここでは転送のみ
-  // 実際の結合はoffscreen.jsで行う
-  // この関数はbackground.jsのonMessageで呼ばれるが、
-  // offscreenが自分でlistenするのでここでは何もしない
-  return { ok: true };
-}
-
-// === ZIP作成＆ダウンロード ===
-async function createAndDownloadZip(capturedImages, results, settings) {
-  // offscreen documentでJSZipを使ってZIP作成
+// === offscreen documentの存在を保証 ===
+async function ensureOffscreenDocument() {
   try {
     await chrome.offscreen.createDocument({
       url: "offscreen.html",
-      reasons: ["BLOBS"],
-      justification: "ZIP作成にBlobを使用",
+      reasons: ["CANVAS"],
+      justification: "画像の結合処理にCanvasを使用",
     });
   } catch (e) {
     if (!e.message.includes("Only a single offscreen")) {
       throw e;
     }
   }
+}
 
+// === offscreenへのメッセージ送信 (sendMessageとの競合を避ける) ===
+function sendMessageToOffscreen(msg) {
+  return new Promise((resolve, reject) => {
+    // offscreenドキュメントにはruntime.sendMessageで送るが、
+    // targetをoffscreenに限定するためフラグを付与
+    msg._targetOffscreen = true;
+    chrome.runtime.sendMessage(msg, (response) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+      } else {
+        resolve(response);
+      }
+    });
+  });
+}
+
+// === ZIP作成＆ダウンロード ===
+// Service Worker内で直接JSZipを使ってZIP作成する
+// offscreenへの大量データ送信を避けることで、全タブ確実に保存できる
+async function createAndDownloadZip(capturedImages, results, settings) {
   const now = new Date();
   const timestamp = formatTimestamp(now);
   const zipFilename = `edge_tabs_capture_${timestamp}.zip`;
@@ -372,35 +377,35 @@ async function createAndDownloadZip(capturedImages, results, settings) {
     ),
   ].join("\n");
 
-  // offscreenにZIP作成を依頼
-  const response = await chrome.runtime.sendMessage({
-    action: "createZip",
-    images: capturedImages.map((img) => ({
-      filename: img.filename,
-      dataUrl: img.dataUrl,
-    })),
-    metadata: JSON.stringify(metadata, null, 2),
-    summary: summaryText,
-    zipFilename,
+  // Service Worker内で直接ZIPを生成
+  const zip = new JSZip();
+
+  // 画像を追加
+  for (const img of capturedImages) {
+    const base64Data = img.dataUrl.split(",")[1];
+    zip.file(img.filename, base64Data, { base64: true });
+  }
+
+  // metadata.jsonを追加
+  zip.file("metadata.json", JSON.stringify(metadata, null, 2));
+
+  // summary.txtを追加
+  zip.file("summary.txt", summaryText);
+
+  // ZIPをbase64で生成
+  const zipBase64 = await zip.generateAsync({
+    type: "base64",
+    compression: "DEFLATE",
+    compressionOptions: { level: 6 },
   });
 
-  // offscreenを閉じる
-  try {
-    await chrome.offscreen.closeDocument();
-  } catch (_) {}
-
-  if (response && response.error) {
-    throw new Error("ZIP作成に失敗: " + response.error);
-  }
-
-  // Blob URLを受け取ってダウンロード
-  if (response && response.blobUrl) {
-    await chrome.downloads.download({
-      url: response.blobUrl,
-      filename: zipFilename,
-      saveAs: true,
-    });
-  }
+  // data URLとしてダウンロード
+  const dataUrl = "data:application/zip;base64," + zipBase64;
+  await chrome.downloads.download({
+    url: dataUrl,
+    filename: zipFilename,
+    saveAs: true,
+  });
 }
 
 // === ユーティリティ関数 ===
@@ -462,6 +467,16 @@ async function waitForTabLoad(tabId, timeout = 10000) {
     const tab = await chrome.tabs.get(tabId);
     if (tab.status === "complete") return;
     await sleep(200);
+  }
+}
+
+// タブが実際にアクティブになるのを待つ
+async function waitForTabActivation(tabId, timeout = 5000) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.active) return;
+    await sleep(100);
   }
 }
 
